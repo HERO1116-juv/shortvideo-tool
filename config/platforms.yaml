@@ -1,0 +1,50 @@
+tiktok:
+  label: "TikTok"
+  aspect: "9:16"
+  max_duration: 60
+  recommended_duration: 30
+  hook_window_sec: 3
+  caption_style: "大きめ・中央・派手なテロップ"
+  trend_weight: 0.7
+  characteristics:
+    - "最初の3秒で必ず視聴者を掴む"
+    - "テンポ重視、間を作らない"
+    - "トレンド音源やフォーマットに乗る"
+    - "縦型フルスクリーン前提"
+    - "顔出し or テキスト主体どちらも有効"
+  cta_style: "コメント・いいね誘導"
+  hashtag_count: 5
+
+reels:
+  label: "Instagram Reels"
+  aspect: "9:16"
+  max_duration: 90
+  recommended_duration: 45
+  hook_window_sec: 5
+  caption_style: "おしゃれ・控えめ・読みやすさ重視"
+  trend_weight: 0.4
+  characteristics:
+    - "保存される情報設計が重要"
+    - "ビジュアル美しさ重視"
+    - "ハウツー・まとめ系が強い"
+    - "キャプションも読まれる"
+    - "ループ視聴を狙う構成"
+  cta_style: "保存・シェア誘導"
+  hashtag_count: 10
+
+x:
+  label: "X (旧Twitter)"
+  aspect: "16:9"
+  max_duration: 140
+  recommended_duration: 60
+  hook_window_sec: 2
+  caption_style: "テロップ強め・要点凝縮・字幕大きめ"
+  trend_weight: 0.5
+  characteristics:
+    - "音声オフ視聴前提なので字幕必須"
+    - "1ツイートで完結する強さが必要"
+    - "議論・共感・情報の3軸"
+    - "横型または1:1も可"
+    - "冒頭2秒でスクロールを止める"
+  cta_style: "リポスト・引用誘導"
+  hashtag_count: 3
