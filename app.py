@@ -1,15 +1,12 @@
 """
-app.py (Week 2版)
-Streamlit製のショート動画台本ジェネレーター
-
-Week 2追加機能:
-  - トレンド自動取得(Googleトレンド + Claude Web検索)
-  - 同条件バリエーション生成(3本出して比較)
-  - サムネ画像生成プロンプトの出力(Week 3への準備)
+app.py (Week 3版)
+台本生成 + 画像生成 + 動画合成 までを統合したUI
 """
 
 import json
 import os
+import zipfile
+import io
 from datetime import datetime
 from pathlib import Path
 
@@ -26,293 +23,307 @@ from modules.trend_collector import (
     collect_all_trends,
     format_trends_for_prompt,
 )
+from modules.image_generator import (
+    generate_images_for_script,
+    estimate_cost as estimate_image_cost,
+)
+from modules.video_composer import compose_video
+from modules.bgm_manager import get_bgm_path, list_available_bgms
 
-# Streamlit CloudのSecretsから環境変数へ
+
+# Secrets読み込み
 if "ANTHROPIC_API_KEY" in st.secrets:
     os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(
-    page_title="ショート動画 台本ジェネレーター v2",
+    page_title="ショート動画ジェネレーター v3",
     page_icon="🎬",
     layout="wide",
 )
 
-st.title("🎬 ショート動画 台本ジェネレーター")
-st.caption("Week 2: トレンド自動取り込み + バリエーション生成 + サムネ画像プロンプト")
+st.title("🎬 ショート動画ジェネレーター")
+st.caption("Week 3: 台本 → 画像生成 → mp4出力までフル自動")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        api_key_input = st.text_input("ANTHROPIC_API_KEY", type="password")
-        if api_key_input:
-            os.environ["ANTHROPIC_API_KEY"] = api_key_input
+    anthropic_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    openai_ok = bool(os.environ.get("OPENAI_API_KEY"))
+
+    if anthropic_ok:
+        st.success("✅ Anthropic APIキー OK")
     else:
-        st.success("APIキー読み込み済み")
+        st.error("❌ Anthropic APIキー未設定")
+    if openai_ok:
+        st.success("✅ OpenAI APIキー OK")
+    else:
+        st.warning("⚠️ OpenAI APIキー未設定(画像生成不可)")
 
+    st.divider()
+    st.subheader("📝 台本生成")
     model = st.selectbox(
-        "台本生成モデル",
+        "モデル",
         ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-        index=0,
-        help="Opus=最高品質、Haiku=低コスト",
+        index=2,
+    )
+    use_google_trends = st.checkbox("Googleトレンド取得", value=True)
+    use_web_search = st.checkbox("Claude Web検索", value=False)
+
+    st.divider()
+    st.subheader("🎨 画像生成")
+    image_quality = st.selectbox(
+        "画質",
+        ["low", "medium", "high"],
+        index=1,
+        help="low=$0.011/枚, medium=$0.042/枚, high=$0.167/枚",
     )
 
     st.divider()
-    st.subheader("🔥 トレンド取得")
-    use_google_trends = st.checkbox(
-        "Googleトレンド取得", value=True,
-        help="無料・約5秒"
+    st.subheader("🎬 動画合成")
+    bgm_choice = st.selectbox(
+        "BGM",
+        ["なし"] + list_available_bgms() + ["アップロード"],
+        index=1,
     )
-    use_web_search = st.checkbox(
-        "Claude Web検索でトレンド取得", value=False,
-        help="プラットフォーム別の最新傾向を取得。1回約5-10円、20-40秒"
-    )
+    user_bgm = None
+    if bgm_choice == "アップロード":
+        bgm_file = st.file_uploader("BGMファイル(mp3)", type=["mp3", "wav"])
+        if bgm_file:
+            user_bgm = bgm_file.read()
 
-    st.divider()
-    st.subheader("🎨 画像生成準備")
-    include_image_prompts = st.checkbox(
-        "サムネ・シーン画像プロンプトを出力",
-        value=True,
-        help="Week 3で画像生成APIに渡せる形式で出力"
-    )
+    bgm_volume = st.slider("BGM音量", 0.0, 1.0, 0.3, 0.05)
 
-# --- メインフォーム ---
-col1, col2 = st.columns([1, 1])
 
-with col1:
-    st.subheader("📝 入力")
+# --- メインタブ ---
+tab1, tab2, tab3 = st.tabs(["📝 1. 台本生成", "🎨 2. 画像生成", "🎬 3. 動画合成"])
 
-    keywords_text = st.text_area(
-        "キーワード(改行 or カンマ区切り)",
-        value="副業\nAI活用\n月5万",
-        height=100,
-    )
+# Tab 1: 台本生成
+with tab1:
+    st.subheader("台本を生成")
 
-    persona_options = {key: data["label"] for key, data in PERSONAS.items()}
-    persona_key = st.selectbox(
-        "ターゲット層",
-        options=list(persona_options.keys()),
-        format_func=lambda k: persona_options[k],
-    )
-
-    extra_context = st.text_area(
-        "追加コンテキスト(手動入力・任意)",
-        value="",
-        height=70,
-        help="トレンド自動取得を有効にしていればここは空でOK"
-    )
-
-    mode = st.radio(
-        "生成モード",
-        ["3プラットフォーム一括", "1プラットフォーム1本", "1プラットフォーム3バリエーション"],
-        help="バリエーション機能は同じ条件で異なる構成の台本を3本出します"
-    )
-
-    if mode in ["1プラットフォーム1本", "1プラットフォーム3バリエーション"]:
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        keywords_text = st.text_area(
+            "キーワード(改行 or カンマ区切り)",
+            value="副業\nAI活用\n月5万",
+            height=100,
+        )
+        persona_options = {key: data["label"] for key, data in PERSONAS.items()}
+        persona_key = st.selectbox(
+            "ターゲット層",
+            options=list(persona_options.keys()),
+            format_func=lambda k: persona_options[k],
+            key="persona_t1",
+        )
         platform_options = {key: data["label"] for key, data in PLATFORMS.items()}
         platform_key = st.selectbox(
             "プラットフォーム",
             options=list(platform_options.keys()),
             format_func=lambda k: platform_options[k],
+            key="platform_t1",
         )
 
-    # コスト警告
-    if mode == "3プラットフォーム一括":
-        n_generations = 3
-    elif mode == "1プラットフォーム3バリエーション":
-        n_generations = 3
-    else:
-        n_generations = 1
+    with col2:
+        extra_context = st.text_area("追加コンテキスト(任意)", value="", height=80)
+        st.info(f"💰 概算: {'約10円' if 'opus' in model else '約1円'}")
 
-    n_web_searches = n_generations if use_web_search else 0
-    cost_estimate = f"⏱️ 予想時間: {15 + n_web_searches * 25}秒〜 / 💰 概算: 約{(n_generations * (10 if 'opus' in model else 1)) + (n_web_searches * 5)}円"
-    st.caption(cost_estimate)
-
-    generate_btn = st.button("🚀 台本を生成", type="primary", use_container_width=True)
-
-# --- 生成処理 ---
-with col2:
-    st.subheader("📺 生成結果")
-
-    if generate_btn:
-        keywords = [
-            k.strip()
-            for k in keywords_text.replace(",", "\n").replace("、", "\n").split("\n")
-            if k.strip()
-        ]
-
+    if st.button("🚀 台本を生成", type="primary", use_container_width=True):
+        keywords = [k.strip() for k in keywords_text.replace(",", "\n").replace("、", "\n").split("\n") if k.strip()]
         if not keywords:
-            st.error("キーワードを1つ以上入力してください")
-        elif not os.environ.get("ANTHROPIC_API_KEY"):
-            st.error("ANTHROPIC_API_KEYが設定されていません")
+            st.error("キーワードを入力してください")
+        elif not anthropic_ok:
+            st.error("Anthropic APIキーが必要")
         else:
-            try:
-                # ----- トレンド取得 -----
-                trends_by_platform = {}
-                target_platforms = (
-                    ["tiktok", "reels", "x"]
-                    if mode == "3プラットフォーム一括"
-                    else [platform_key]
-                )
+            trends_text = ""
+            if use_google_trends or use_web_search:
+                with st.spinner("🔥 トレンド収集中..."):
+                    trends = collect_all_trends(
+                        keywords, platform_key,
+                        use_google_trends=use_google_trends,
+                        use_web_search=use_web_search,
+                    )
+                    trends_text = format_trends_for_prompt(trends)
+                    if trends_text:
+                        with st.expander("トレンド情報"):
+                            st.markdown(trends_text)
 
-                if use_google_trends or use_web_search:
-                    with st.spinner("🔥 トレンド情報を収集中..."):
-                        for pf in target_platforms:
-                            trends = collect_all_trends(
-                                keywords, pf,
-                                use_google_trends=use_google_trends,
-                                use_web_search=use_web_search,
-                            )
-                            formatted = format_trends_for_prompt(trends)
-                            trends_by_platform[pf] = formatted
-                            if formatted:
-                                with st.expander(f"📊 {PLATFORMS[pf]['label']}のトレンド情報"):
-                                    st.markdown(formatted)
+            ctx = (extra_context + "\n\n" + trends_text) if trends_text else extra_context
 
-                # ----- 台本生成 -----
-                if mode == "3プラットフォーム一括":
-                    with st.spinner("3プラットフォーム分の台本を生成中..."):
-                        results = generate_for_all_platforms(
-                            keywords, persona_key, extra_context,
-                            model=model,
-                            include_image_prompts=include_image_prompts,
-                            trends_by_platform=trends_by_platform,
-                        )
-                    st.session_state["results"] = results
-                    st.session_state["display_mode"] = "platforms"
+            with st.spinner("台本生成中..."):
+                try:
+                    script = generate_script(
+                        keywords, persona_key, platform_key, ctx,
+                        model=model, include_image_prompts=True,
+                    )
+                    st.session_state["script"] = script
+                    st.session_state["script_platform"] = platform_key
+                    st.success("✅ 台本生成完了")
+                except Exception as e:
+                    st.error(f"エラー: {e}")
 
-                elif mode == "1プラットフォーム1本":
-                    ctx = extra_context
-                    if trends_by_platform.get(platform_key):
-                        ctx = (ctx + "\n\n" + trends_by_platform[platform_key]) if ctx else trends_by_platform[platform_key]
-                    with st.spinner(f"{PLATFORMS[platform_key]['label']}の台本を生成中..."):
-                        result = generate_script(
-                            keywords, persona_key, platform_key, ctx,
-                            model=model,
-                            include_image_prompts=include_image_prompts,
-                        )
-                    st.session_state["results"] = {platform_key: result}
-                    st.session_state["display_mode"] = "single"
+    if "script" in st.session_state:
+        script = st.session_state["script"]
+        st.divider()
+        st.markdown(f"### 🎯 {script.get('title', '')}")
+        st.info(f"**フック**: {script.get('hook', '')}")
+        st.markdown("#### シーン")
+        for i, scene in enumerate(script.get("scenes", []), 1):
+            with st.expander(f"Scene {i} ({scene.get('time', '')})"):
+                st.markdown(f"**字幕**: {scene.get('text', '')}")
+                st.markdown(f"**画像プロンプト**: `{scene.get('scene_image_prompt', '')[:100]}...`")
+        st.markdown(f"**サムネ文言**: `{script.get('thumbnail_text', '')}`")
 
-                else:  # バリエーション
-                    ctx = extra_context
-                    if trends_by_platform.get(platform_key):
-                        ctx = (ctx + "\n\n" + trends_by_platform[platform_key]) if ctx else trends_by_platform[platform_key]
-                    with st.spinner(f"{PLATFORMS[platform_key]['label']}の3バリエーションを生成中..."):
-                        variations = generate_variations(
-                            keywords, persona_key, platform_key, ctx,
-                            model=model, n=3,
-                            include_image_prompts=include_image_prompts,
-                        )
-                    st.session_state["results"] = {
-                        f"variation_{i+1}": v for i, v in enumerate(variations)
-                    }
-                    st.session_state["display_mode"] = "variations"
-                    st.session_state["variation_platform"] = platform_key
+# Tab 2: 画像生成
+with tab2:
+    st.subheader("画像を生成")
 
-                # 自動保存
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = OUTPUT_DIR / f"script_{timestamp}.json"
-                with open(save_path, "w", encoding="utf-8") as f:
-                    json.dump(st.session_state["results"], f, ensure_ascii=False, indent=2)
-                st.success(f"生成完了 ✅ ({save_path.name})")
-
-            except Exception as e:
-                st.error(f"エラー: {e}")
-                import traceback
-                with st.expander("詳細"):
-                    st.code(traceback.format_exc())
-
-# --- 結果表示 ---
-if "results" in st.session_state:
-    results = st.session_state["results"]
-    display_mode = st.session_state.get("display_mode", "single")
-
-    if display_mode == "variations":
-        platform_label = PLATFORMS[st.session_state.get("variation_platform", "tiktok")]["label"]
-        tab_labels = [f"案{i+1} ({platform_label})" for i in range(len(results))]
+    if "script" not in st.session_state:
+        st.warning("先にTab 1で台本を生成してください")
     else:
-        tab_labels = [
-            PLATFORMS[k]["label"] if k in PLATFORMS else k
-            for k in results.keys()
-        ]
+        script = st.session_state["script"]
+        scenes = script.get("scenes", [])
+        n_scenes = len(scenes)
 
-    tabs = st.tabs(tab_labels)
+        cost = estimate_image_cost(n_scenes, include_thumbnail=True, quality=image_quality)
+        st.info(f"💰 概算: {cost['images']}枚 × {image_quality} = **約{cost['jpy']}円** (${cost['usd']})")
 
-    for tab, (key, script) in zip(tabs, results.items()):
-        with tab:
-            if "error" in script:
-                st.error(f"生成失敗: {script['error']}")
-                continue
+        include_thumb = st.checkbox("サムネも生成", value=True)
 
-            st.markdown(f"### 🎯 {script.get('title', '(タイトルなし)')}")
-            st.info(f"**フック**: {script.get('hook', '')}")
+        if st.button("🎨 画像を生成", type="primary", use_container_width=True):
+            if not openai_ok:
+                st.error("OpenAI APIキーが必要")
+            else:
+                platform_key_t2 = st.session_state.get("script_platform", "tiktok")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                img_dir = OUTPUT_DIR / f"images_{timestamp}"
 
-            st.markdown("#### 📋 シーン構成")
-            scenes = script.get("scenes", [])
-            for i, scene in enumerate(scenes, 1):
-                preview = scene.get('text', '')[:30]
-                with st.expander(f"Scene {i} ({scene.get('time', '')}): {preview}..."):
-                    st.markdown(f"**字幕**: {scene.get('text', '')}")
-                    st.markdown(f"**映像指示**: {scene.get('visual', '')}")
-                    st.markdown(f"**ナレーション**: {scene.get('narration', '')}")
-                    if scene.get('scene_image_prompt'):
-                        st.markdown("**🎨 画像生成プロンプト(Week 3用)**")
-                        st.code(scene['scene_image_prompt'], language=None)
+                with st.spinner(f"画像{cost['images']}枚を生成中(2〜5分)..."):
+                    try:
+                        results = generate_images_for_script(
+                            script,
+                            platform_key=platform_key_t2,
+                            quality=image_quality,
+                            include_thumbnail=include_thumb,
+                            output_dir=img_dir,
+                        )
+                        st.session_state["images"] = results
+                        st.session_state["image_dir"] = img_dir
+                        st.success(f"✅ 画像生成完了({len(results['scenes'])}枚 + サムネ{'あり' if results['thumbnail'] else 'なし'})")
+                        if results["errors"]:
+                            with st.expander(f"⚠️ {len(results['errors'])}件のエラー"):
+                                for err in results["errors"]:
+                                    st.warning(err)
+                    except Exception as e:
+                        st.error(f"エラー: {e}")
 
-            st.markdown(f"**🎤 CTA**: {script.get('cta', '')}")
+    if "images" in st.session_state:
+        results = st.session_state["images"]
+        st.divider()
+        st.subheader("生成された画像")
+        if results.get("thumbnail"):
+            st.markdown("**サムネ**")
+            st.image(str(results["thumbnail"]), width=300)
+        cols = st.columns(min(len(results["scenes"]), 4) or 1)
+        for i, img_path in enumerate(results["scenes"]):
+            with cols[i % len(cols)]:
+                st.image(str(img_path), caption=f"Scene {i+1}", use_column_width=True)
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**📝 キャプション**")
-                st.code(script.get("caption", ""), language=None)
-            with col_b:
-                st.markdown("**🏷️ ハッシュタグ**")
-                st.code(" ".join(script.get("hashtags", [])), language=None)
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            if results.get("thumbnail"):
+                zf.write(results["thumbnail"], "thumbnail.png")
+            for p in results["scenes"]:
+                zf.write(p, p.name)
+        st.download_button(
+            "💾 画像をZIPでダウンロード",
+            data=zip_buf.getvalue(),
+            file_name=f"images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+        )
 
-            # サムネ情報
-            if script.get("thumbnail_text") or script.get("thumbnail_image_prompt"):
-                st.markdown("#### 🖼️ サムネイル情報")
-                if script.get("thumbnail_text"):
-                    st.markdown(f"**サムネ文言**: `{script['thumbnail_text']}`")
-                if script.get("thumbnail_image_prompt"):
-                    st.markdown("**サムネ画像生成プロンプト(Week 3で使用)**")
-                    st.code(script['thumbnail_image_prompt'], language=None)
+# Tab 3: 動画合成
+with tab3:
+    st.subheader("動画を合成")
 
-            with st.expander("📦 生JSONを見る"):
-                st.code(json.dumps(script, ensure_ascii=False, indent=2), language="json")
+    if "script" not in st.session_state:
+        st.warning("先にTab 1で台本を生成してください")
+    elif "images" not in st.session_state:
+        st.warning("先にTab 2で画像を生成してください")
+    else:
+        script = st.session_state["script"]
+        images = st.session_state["images"]
+        platform_key_t3 = st.session_state.get("script_platform", "tiktok")
 
-    st.download_button(
-        "💾 全結果をJSONダウンロード",
-        data=json.dumps(results, ensure_ascii=False, indent=2),
-        file_name=f"scripts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json",
-    )
+        st.info(f"📋 動画情報: {PLATFORMS[platform_key_t3]['label']} / シーン数 {len(script.get('scenes', []))} / 画像 {len(images['scenes'])}枚")
+
+        if st.button("🎬 mp4を合成", type="primary", use_container_width=True):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = OUTPUT_DIR / f"video_{timestamp}.mp4"
+
+            bgm_path = None
+            if bgm_choice != "なし":
+                with st.spinner("BGM準備中..."):
+                    if bgm_choice == "アップロード" and user_bgm:
+                        bgm_path = get_bgm_path(user_uploaded=user_bgm)
+                    elif bgm_choice in list_available_bgms():
+                        bgm_path = get_bgm_path(name=bgm_choice)
+
+            with st.spinner("動画を合成中(3〜10分)..."):
+                try:
+                    result = compose_video(
+                        script,
+                        image_paths=images["scenes"],
+                        output_path=output_path,
+                        platform_key=platform_key_t3,
+                        bgm_path=bgm_path,
+                        bgm_volume=bgm_volume,
+                    )
+                    if result["error"]:
+                        st.error(f"動画合成失敗: {result['error']}")
+                    else:
+                        st.session_state["video_path"] = result["output_path"]
+                        st.success(f"✅ 動画合成完了({result['duration']:.1f}秒)")
+                except Exception as e:
+                    st.error(f"エラー: {e}")
+                    import traceback
+                    with st.expander("詳細"):
+                        st.code(traceback.format_exc())
+
+    if "video_path" in st.session_state:
+        video_path = st.session_state["video_path"]
+        if Path(video_path).exists():
+            st.divider()
+            st.subheader("🎉 完成した動画")
+            with open(video_path, "rb") as f:
+                video_bytes = f.read()
+            st.video(video_bytes)
+            st.download_button(
+                "💾 mp4をダウンロード",
+                data=video_bytes,
+                file_name=Path(video_path).name,
+                mime="video/mp4",
+            )
 
 st.divider()
-with st.expander("📚 Week 2の使い方"):
+with st.expander("📚 Week 3の使い方"):
     st.markdown("""
-**新機能の使い方**
+**3ステップで完成:**
+1. **Tab 1**: 台本を生成(画像プロンプト付き)
+2. **Tab 2**: gpt-image-1で画像を5〜8枚生成(2〜5分、50〜80円)
+3. **Tab 3**: MoviePyでmp4合成(3〜10分、無料)
 
-1. **トレンド取得を有効化**
-   - サイドバーで「Googleトレンド」「Claude Web検索」をON
-   - 生成時に自動でトレンド情報を取得して台本に反映
+**コスト目安:**
+- 台本(Haiku) + 画像7枚(medium) = 約30円
+- 台本(Opus) + 画像7枚(high) = 約140円
 
-2. **バリエーション生成**
-   - 「1プラットフォーム3バリエーション」モードを選択
-   - 同じ条件で異なる構成の台本を3本出力
-   - ストーリー型 / 問題提起型 / 意外性型の3パターン
-
-3. **画像生成プロンプト**
-   - 「サムネ・シーン画像プロンプトを出力」をON
-   - 各シーンとサムネに画像生成用プロンプトが付与される
-   - Week 3で画像生成API(gpt-image-1等)にそのまま渡せる
-
-**コストの目安**
-- Haiku + トレンドOFF: 1〜3円
-- Opus + トレンドON(3プラットフォーム): 50〜80円
+**注意:**
+- Streamlit Cloud無料プランは1GBメモリ制限。長尺やhigh画質はメモリ不足の可能性
+- 動画合成は時間がかかるので途中で画面を閉じない
+- 初回BGMダウンロードに時間がかかる場合あり
 """)
